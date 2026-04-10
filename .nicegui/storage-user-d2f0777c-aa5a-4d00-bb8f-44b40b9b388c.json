@@ -1,0 +1,1 @@
+{"username":"Developer","past_sessions":[],"rca":{"prompt":"can you analyse what is wrong with the recent deployment ? ","session_id":"86914c78","owner":"rahul-mishra-msx","repo_name":"rca-erros","arch":[{"type":"lambda","value":"/aws/lambda/rca-testing-function","desc":"main lambda function"}]}}
