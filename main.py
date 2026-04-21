@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import secrets
 import uuid
@@ -314,6 +315,8 @@ def build_payload(
     arch: list[dict[str, str]],
     repo_owner: str = "",
     repo_name: str = "",
+    *,
+    user_id: str = "",
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "prompt": prompt,
@@ -324,6 +327,10 @@ def build_payload(
     name = (repo_name or "").strip()
     if owner or name:
         body["repo"] = {"ownerId": owner, "name": name}
+    uid = (user_id or "").strip()
+    if uid:
+        body["userId"] = uid
+    print("[RCA] /invocations payload:", json.dumps(body, indent=2, ensure_ascii=False))
     return body
 
 
@@ -394,6 +401,9 @@ async def process_oauth_callback(request: Request) -> None:
             raise RuntimeError("No id_token in token response")
         claims = verify_id_token(settings, id_tok)
         app.storage.user["username"] = claims_to_username(claims)
+        sub = claims.get("sub")
+        if isinstance(sub, str) and sub.strip():
+            app.storage.user["user_id"] = sub.strip()
         app.storage.user["auth_provider"] = "cognito"
         app.storage.user["cognito_id_token"] = id_tok
         at = tokens.get("access_token")
@@ -437,6 +447,7 @@ async def landing_page(request: Request) -> None:
 
     def open_developer_login() -> None:
         app.storage.user["username"] = "Developer"
+        app.storage.user["user_id"] = "local:developer"
         ensure_past_sessions()
         ui.navigate.to("/workspace")
 

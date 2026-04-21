@@ -275,12 +275,16 @@ def register_workspace_page(
 
             base = (get_agent_api_base() or default_api_base).rstrip("/")
             url = f"{base}/invocations"
+            uid = (app.storage.user.get("user_id") or "").strip()
+            if not uid:
+                uid = (app.storage.user.get("username") or "").strip()
             payload = build_payload(
                 prompt,
                 session_id,
                 [{k: row[k] for k in ("type", "value", "desc")} for row in arch_rows],
                 ro,
                 rn,
+                user_id=uid,
             )
 
             stored.clear()
