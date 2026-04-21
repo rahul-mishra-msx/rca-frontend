@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import copy
 import os
+import secrets
 import uuid
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+from fastapi import Request
 from nicegui import app, ui
+
+load_dotenv()
+
+from cognito_auth import (
+    build_authorize_url,
+    claims_to_username,
+    exchange_code_for_tokens,
+    get_cognito_logout_redirect_url,
+    load_cognito_settings,
+    oauth_callback_path,
+    verify_id_token,
+)
 
 # Defaults aligned with local curl and sample logs under ./logs
 DEFAULT_API_BASE = "http://localhost:8080"
@@ -26,6 +40,7 @@ DEFAULT_REPO = {"ownerId": "rahul-mishra-msx", "name": "rca-erros"}
 # Set on Sessions when starting a run; Agents page consumes and starts analysis after load.
 STORAGE_AUTO_START_RUN = "auto_start_run"
 STORAGE_UI_SETTINGS = "ui_settings"
+STORAGE_OAUTH_STATE = "oauth_state"
 
 DEFAULT_AGENT_HOST = "localhost"
 DEFAULT_AGENT_PORT = 8080
@@ -237,10 +252,16 @@ def is_logged_in() -> bool:
 
 def logout() -> None:
     preserved = app.storage.user.get(STORAGE_UI_SETTINGS)
+    cognito_out = None
+    if app.storage.user.get("auth_provider") == "cognito":
+        cognito_out = get_cognito_logout_redirect_url()
     app.storage.user.clear()
     if preserved is not None:
         app.storage.user[STORAGE_UI_SETTINGS] = preserved
-    ui.navigate.to("/")
+    if cognito_out:
+        ui.navigate.to(cognito_out)
+    else:
+        ui.navigate.to("/")
 
 
 AGENTS_HEADER_LOADING = "···"
@@ -339,12 +360,80 @@ def _arch_editor(arch_state: list[dict[str, str]], refreshable: Any) -> None:
     ).props("flat dense sm")
 
 
+async def process_oauth_callback(request: Request) -> None:
+    """Complete Cognito authorization_code flow; on success navigates to /workspace."""
+    err = request.query_params.get("error")
+    if err:
+        desc = request.query_params.get("error_description") or err
+        with ui.column().classes("w-full min-h-screen items-center justify-center gap-4 p-8"):
+            ui.label(f"Sign-in was cancelled or failed: {desc}").classes("text-red-300 text-center max-w-lg")
+            ui.button("Back to login", on_click=lambda: ui.navigate.to("/"))
+        return
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    expected = app.storage.user.get(STORAGE_OAUTH_STATE)
+    if not code or not state or not expected or state != expected:
+        app.storage.user.pop(STORAGE_OAUTH_STATE, None)
+        with ui.column().classes("w-full min-h-screen items-center justify-center gap-4 p-8"):
+            ui.label("Invalid or expired sign-in. Please try again from the home page.").classes(
+                "text-amber-300 text-center max-w-lg"
+            )
+            ui.button("Back to login", on_click=lambda: ui.navigate.to("/"))
+        return
+    app.storage.user.pop(STORAGE_OAUTH_STATE, None)
+    settings = load_cognito_settings()
+    if not settings:
+        with ui.column().classes("w-full min-h-screen items-center justify-center gap-4 p-8"):
+            ui.label("Cognito is not configured on the server.").classes("text-red-300")
+            ui.button("Back", on_click=lambda: ui.navigate.to("/"))
+        return
+    try:
+        tokens = await exchange_code_for_tokens(settings, code)
+        id_tok = tokens.get("id_token")
+        if not id_tok or not isinstance(id_tok, str):
+            raise RuntimeError("No id_token in token response")
+        claims = verify_id_token(settings, id_tok)
+        app.storage.user["username"] = claims_to_username(claims)
+        app.storage.user["auth_provider"] = "cognito"
+        app.storage.user["cognito_id_token"] = id_tok
+        at = tokens.get("access_token")
+        if at:
+            app.storage.user["cognito_access_token"] = at
+        rt = tokens.get("refresh_token")
+        if rt:
+            app.storage.user["cognito_refresh_token"] = rt
+        ensure_past_sessions()
+        ui.navigate.to("/workspace")
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        with ui.column().classes("w-full min-h-screen items-center justify-center gap-4 p-8"):
+            ui.label("Could not complete sign-in").classes("text-lg text-red-300")
+            ui.label(msg).classes("text-red-400/90 text-sm whitespace-pre-wrap max-w-xl")
+            ui.button("Back to login", on_click=lambda: ui.navigate.to("/"))
+
+
 @ui.page("/")
-def landing_page() -> None:
+async def landing_page(request: Request) -> None:
     apply_global_theme()
 
+    if oauth_callback_path() == "/" and (
+        request.query_params.get("code") is not None or request.query_params.get("error") is not None
+    ):
+        await process_oauth_callback(request)
+        return
+
     def open_cognito() -> None:
-        ui.notify("Cognito login is not wired yet.", type="info")
+        settings = load_cognito_settings()
+        if not settings:
+            ui.notify(
+                "Cognito is not configured. Set COGNITO_USER_POOL_ID, COGNITO_CLIENT_ID, "
+                "COGNITO_OAUTH_DOMAIN, and COGNITO_REDIRECT_URI (must match Cognito app client).",
+                type="negative",
+            )
+            return
+        st = secrets.token_urlsafe(32)
+        app.storage.user[STORAGE_OAUTH_STATE] = st
+        ui.navigate.to(build_authorize_url(settings, st))
 
     def open_developer_login() -> None:
         app.storage.user["username"] = "Developer"
@@ -375,6 +464,15 @@ def landing_page() -> None:
                     with ui.column().classes("items-center gap-2"):
                         ui.icon("code", size="lg").classes("text-cyan-400")
                         ui.label("Developer").classes("text-lg font-medium text-center")
+
+
+_oauth_cb = oauth_callback_path()
+if _oauth_cb != "/":
+
+    @ui.page(_oauth_cb, response_timeout=45.0)
+    async def cognito_oauth_callback(request: Request) -> None:
+        apply_global_theme()
+        await process_oauth_callback(request)
 
 
 from workspace_page import register_workspace_page
@@ -420,7 +518,6 @@ def legacy_agents_redirect() -> None:
 
 
 def main() -> None:
-    load_dotenv()
     storage_secret = (os.environ.get("STORAGE_SECRET") or "").strip()
     if not storage_secret:
         raise SystemExit(
@@ -429,7 +526,7 @@ def main() -> None:
         )
     ui.run(
         title="RCA Workspace",
-        port=8081,
+        port=int(os.environ.get("PORT", "8081")),
         reload=True,
         favicon="🧩",
         storage_secret=storage_secret,
